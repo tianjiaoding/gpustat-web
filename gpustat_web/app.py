@@ -28,7 +28,7 @@ import aiohttp_jinja2 as aiojinja2
 
 __PATH__ = os.path.abspath(os.path.dirname(__file__))
 
-DEFAULT_GPUSTAT_COMMAND = "gpustat --color --gpuname-width 25"
+DEFAULT_GPUSTAT_COMMAND = "conda run -n gpustat gpustat --color --gpuname-width 25"
 
 
 ###############################################################################
