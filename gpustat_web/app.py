@@ -24,6 +24,9 @@ from collections import OrderedDict, Counter
 from termcolor import cprint, colored
 from aiohttp import web
 import aiohttp_jinja2 as aiojinja2
+import queue
+
+
 
 
 __PATH__ = os.path.abspath(os.path.dirname(__file__))
@@ -39,14 +42,49 @@ class Context(object):
     '''The global context object.'''
     def __init__(self):
         self.host_status = OrderedDict()
+        self.host_gpu = OrderedDict()
         self.interval = 5.0
+        self.queue = queue.Queue()
+        # for _ in range(3):
+        #     self.queue.put('uname -a')
+            # self.queue.put('whoami')
 
     def host_set_message(self, hostname: str, msg: str):
         self.host_status[hostname] = colored(f"({hostname}) ", 'white') + msg + '\n'
 
-
 context = Context()
 
+async def add_jobs(poll_delay=None):
+    if poll_delay is None:
+        poll_delay = context.interval
+    async def _loop_body():
+        while True:
+            if os.path.exists('jobs_in.txt'):
+                with open('jobs_out.txt', 'a') as f_out, open('jobs_in.txt') as f_in:
+                    for line in f_in:
+                        line = line.strip()
+                        if len(line) == 0:
+                            continue
+                        context.queue.put_nowait(line)
+                        f_out.write(line+'\n')
+                        print(f'added a job: {line}')
+                os.remove('jobs_in.txt')
+            await asyncio.sleep(poll_delay)
+
+    while True:
+        try:
+            await _loop_body()
+
+        except asyncio.CancelledError:
+            print("local worker closed as being cancelled.")
+            break
+        except Exception as e:
+            print(f"an error occured in local worker, {type(e).__name__}: {e}")
+            raise
+
+        # retry upon timeout/disconnected, etc.
+        cprint(f"[{hostname:<{L}}] Disconnected, retrying in {poll_delay} sec...", color='yellow')
+        await asyncio.sleep(poll_delay)
 
 async def run_client(hostname: str, exec_cmd: str, *, port=22,
                      poll_delay=None, timeout=30.0,
@@ -65,6 +103,7 @@ async def run_client(hostname: str, exec_cmd: str, *, port=22,
                 if False: #verbose: XXX DEBUG
                     print(f"[{hostname:<{L}}] querying... ")
 
+                # query for web
                 result = await asyncio.wait_for(conn.run(exec_cmd), timeout=timeout)
 
                 now = datetime.now().strftime('%Y/%m/%d-%H:%M:%S.%f')
@@ -78,6 +117,60 @@ async def run_client(hostname: str, exec_cmd: str, *, port=22,
                         cprint(f"[{now} [{hostname:<{L}}] OK from gpustat ({len(result.stdout)} bytes)", color='cyan')
                     # update data
                     context.host_status[hostname] = result.stdout
+
+                # query for running
+                result = await asyncio.wait_for(conn.run("nvidia-smi | grep '%\|CUDA'"), timeout=timeout)
+                if result.exit_status == 0:
+                    cuda_ver = result.stdout.split('|')[1].split('Version: ')[-1].strip()
+                    gpu_status = result.stdout.split('|')[3:]
+                    gpu_dict = dict()
+                    for i in range(len(gpu_status) // 4):
+                        index = i * 4
+                        gpu_state = str(gpu_status[index].split('   ')[2].strip())
+                        gpu_power = int(gpu_status[index].split('   ')[-1].split('/')[0].split('W')[0].strip())
+                        gpu_memory = int(gpu_status[index + 1].split('/')[0].split('M')[0].strip())
+                        gpu_dict[i] = (gpu_state, gpu_power, gpu_memory)
+                    context.host_gpu[hostname] = gpu_dict
+                    # print(f'cuda ver: {cuda_ver}')
+                    conda_env_dict = {
+                        '10.1': 'mcr2_cuda101',
+                        '10.2': 'mcr2_cuda102b',
+                        '11.0': 'mcr2_cuda102b',
+                        '11.5': 'mcr2_cuda116',
+                        '11.6': 'mcr2_cuda116',
+                        '11.7': 'mcr2_cuda116',
+                        '11.8': 'mcr2_cuda116'
+                    }
+
+                    min_gpu_number = 2
+                    available_gpus = []
+                    for i, (gpu_state, gpu_power, gpu_memory) in gpu_dict.items():
+                        if gpu_power <= 70 and gpu_memory <= 900:
+                            gpu_str = f"GPU/id: {i}, GPU/state: {gpu_state}, GPU/memory: {gpu_memory}MiB, GPU/power: {gpu_power}W\n "
+                            # print(gpu_str)
+                            available_gpus.append(i)
+                    if len(available_gpus) >= min_gpu_number and 'io88' not in hostname and 'io89' not in hostname:
+                        # and 'io52' not in hostname
+                        # print(f'{len(available_gpus)}>={min_gpu_number} gpus available on {hostname}')
+                        try:
+                            job = context.queue.get_nowait()
+                            # command = f"CUDA_VISIBLE_DEVICES={available_gpus[0]},{available_gpus[1]} nohup conda run -n {conda_env_dict[cuda_ver]} {job} &"
+                            command = f"CUDA_VISIBLE_DEVICES={available_gpus[0]},{available_gpus[1]} nohup conda run -n {conda_env_dict[cuda_ver]} sh -c '{job}' &"
+                            # command = f"CUDA_VISIBLE_DEVICES={available_gpus[0]} nohup conda run -n {conda_env_dict[cuda_ver]} sh -c '{job}' &"
+                            # 2 > / dev / null
+                            print(hostname)
+                            print(command)
+                            # result = await asyncio.wait_for(conn.run(command), timeout=timeout)
+                            # print(result.stdout)
+                            await conn.create_process(command)
+                            await asyncio.sleep(120) # wait 60 seconds for things to take memory, etc.
+                            # print('create')
+                        except queue.Empty:
+                            # print('did not get a job from queue')
+                            pass
+                        except Exception as ex:
+                            raise ex
+
 
                 # wait for a while...
                 await asyncio.sleep(poll_delay)
@@ -135,7 +228,7 @@ async def spawn_clients(hosts: List[str], exec_cmd: str, *,
             run_client(hostname, exec_cmd, port=port or default_port,
                     verbose=verbose, name_length=name_length)
             for (hostname, port) in zip(host_names, host_ports)
-        ])
+        ], add_jobs())
     except Exception as ex:
         # TODO: throw the exception outside and let aiohttp abort startup
         traceback.print_exc()
